@@ -1,8 +1,148 @@
+# importing relevant libraries
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 import matplotlib.pyplot as plt
+import math
 
 %matplotlib inline
 import matplotlib as mpl
 
+# Pre-processing step using tensorflow to create a variable windowed dataset of specified batch size from the signals. The window is shifted each time across the signal where 
+# the data within the window are input features while the next data point is the label.
+
+# The following helping function helps to create the dataset in the required format for training and testing 
+def windowed_dataset(series, window_size, batch_size, shuffle_buffer):
+    dataset = tf.data.Dataset.from_tensor_slices(series)
+    dataset = dataset.window(window_size + 1, shift=1, drop_remainder=True)
+    dataset = dataset.flat_map(lambda window: window.batch(window_size + 1))
+    dataset = dataset.shuffle(shuffle_buffer).map(lambda window:(window[:-1], window[-1]))
+    dataset = dataset.batch(batch_size).prefetch(1)
+    return dataset
+    
+# This function helps to plot the learning curves during the training of the models 
+def plot_learning_curves(loss, val_loss):
+    plt.plot(np.arange(len(loss)) + 0.5, loss, "b.-", label="Training loss")
+    plt.plot(np.arange(len(val_loss)) + 1, val_loss, "r.-", label="Validation loss")
+    plt.gca().xaxis.set_major_locator(mpl.ticker.MaxNLocator(integer=True))
+    plt.axis([0, 100, 0, 20])
+    plt.legend(fontsize=14)
+    plt.xlabel("Epochs")
+    plt.ylabel("Loss")
+    plt.grid(True)
+    
+    
+df = pd.read_csv("actual_experiments/signal.csv") # reading the sensor signal data from directory using pandas
+series = df["res_bm"] # creating the series 
+
+# Splitting the data into 70% training, 15% validation and 15% testing
+split_time = math.ceil(0.7*len(series))
+x_train = series[:split_time] # 70% of the data
+rem = series[split_time:] # remaining 30%
+split_time2 = math.ceil(0.5*len(rem))
+x_valid = rem[:split_time2]
+x_test = rem[split_time2:]
+
+window_size = 100 # can be varied
+batch_size = 32
+shuffle_buffer_size = 1000
+
+dataset_train = windowed_dataset(x_train, window_size, batch_size, shuffle_buffer_size)
+dataset_valid = windowed_dataset(x_valid, window_size, batch_size, shuffle_buffer_size)
+dataset_test = windowed_dataset(x_test, window_size, batch_size, shuffle_buffer_size)
+    
+# Creating an artificial neural network with optimised hyperparameters namely, number of neurons in the dense layers
+
+model_dnn = tf.keras.models.Sequential([
+    tf.keras.layers.Dense(128, input_shape=[window_size], 
+                           activation="relu"), 
+    tf.keras.layers.Dense(16, activation="relu"),
+    tf.keras.layers.Dense(1)
+])
+model_dnn.compile(loss="mse", optimizer = tf.keras.optimizers.Adam(lr=0.0001), metrics=["mae"]) # compiling the model
+history = model_dnn.fit(dataset_train, epochs=500, validation_data = dataset_valid, verbose=1)
+
+plot_learning_curves(history.history["loss"], history.history["val_loss"])
+plt.show() # a simple visualisation of the learning curve, per epoch, during training and validation
+
+
+forecast_dnn = []
+for time in range(len(series)-window_size):
+    forecast_dnn.append(model_dnn.predict(series[time:time + window_size][np.newaxis,:]))  
+pred_dnn = forecast_dnn[split_time+split_time2-window_size:] # the prediction on the test set
+pred_dnn = np.array(pred_dnn)[:, 0, 0]
+
+# Visualising how the prediction compares with the test set
+time_step = np.arange(len(pred_dnn))
+fig, ax = plt.subplots(1,1)
+ax.plot(time_step,x_test)
+ax.plot(time_step,pred_dnn,alpha=0.5)
+
+np.mean(tf.keras.metrics.mean_absolute_error(x_test, pred_dnn).numpy()) # calculating the mae of the predictions
+
+# Predicting one value at a time up to the specified prediction length (pred_len) using the training network
+pred_len = 100
+arr_dnn=series[-100:]
+for i in range(pred_len):
+    pred_val=model_dnn.predict(arr_dnn[-100:][np.newaxis,:])
+    arr_dnn=np.append(arr_dnn,pred_val)
+arr_dnn[100:].mean() # mean of the forecasted signals for the next machining cut
+
+# Reading in data from the next machining cut and comparing with the forecasts
+df2 = pd.read_csv("actual_experiments/signal2.csv")
+df2.head()
+
+series2 = df2["res_bm"]
+ground_truth2 = series2[0:100]
+ground_truth2.mean() # mean of "ground truth" signals of corresponding length
+
+np.mean(tf.keras.metrics.mean_absolute_error(ground_truth2, pass2_pred).numpy()) # checking the mae between the forecast and the "ground truth" signal
+
+time_step = np.arange(100)
+plt.plot(time_step, arr_dnn[100:], "r--", label = "prediction")
+plt.plot(time_step, ground_truth2, label = "ground truth pass 2")
+plt.legend()
+
+# Extracting statistical features from the forecasted signals
+from scipy.stats import kurtosis
+pass2_pred = arr_dnn[100:]
+pass2_mean_bm = np.mean(pass2_pred)
+pass2_median_bm = np.median(pass2_pred)
+pass2_max_bm = np.max(pass2_pred)
+pass2_std_bm = np.std(pass2_pred)
+pass2_kurt_bm = kurtosis(pass2_pred)
+pass2_rms_bm = np.sqrt(np.mean(pass2_pred**2))
+
+# saving forecasted data to specified directory
+pass2_pred_dnn_df = pd.DataFrame(pass2_pred.reshape(100,1))
+pass2_pred_dnn_df.rename(columns={0:"pass_2_bm"}, inplace=True)
+pass2_pred_dnn_df.head()
+pass2_pred_dnn_df.to_csv("dnn_forecast/pass2bm_pred_100.csv", index=False)
+
+np.mean(tf.keras.metrics.mean_absolute_error(ground_truth2, pass2_pred).numpy())
+
+
+# Tuning the hyperparameters of the ANN using keras tuner
+import keras_tuner as kt
+def build_model(hp):
+    model = tf.keras.models.Sequential()
+    hp_units1 = hp.Int('units1', min_value=32, max_value=512, step=32)
+    hp_units2 = hp.Int('units2', min_value=16, max_value=64, step=16)
+    model.add(tf.keras.layers.Dense(units=hp_units1, input_shape=[window_size], activation='relu'))
+    model.add(tf.keras.layers.Dense(units=hp_units2, activation='relu'))
+    model.add(tf.keras.layers.Dense(1))
+    hp_learning_rate = hp.Choice('learning_rate', values=[1e-3, 1e-4, 1e-5])
+    model.compile(loss="mse",
+                  optimizer=tf.keras.optimizers.Adam(learning_rate=hp_learning_rate),
+                  metrics=["mae"])
+    return model
+
+ tuner = kt.Hyperband(build_model, objective='val_mae', 
+                      max_epochs=100, factor=3, directory='my_dir', project_name='cnn-tune-dnn')
+    
+    
+    
+    
+    
+    
+    
